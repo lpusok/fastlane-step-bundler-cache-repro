@@ -1,0 +1,826 @@
+# frozen_string_literal: true
+
+fastlane_require 'danger'
+fastlane_require 'dotenv/load'
+
+default_platform :ios
+
+platform :ios do
+  ######################
+  # Pre-defined values #
+  ######################
+
+  # The username of the CI user on iTunes Connect.
+  ci_username = 'ci-ios@spothero.com'
+
+  # The value to use with method_options_key when distributing development
+  distribute_development = 'development'
+
+  # The value to use with method_options_key when distributing ad-hoc
+  distribute_ad_hoc = 'ad-hoc'
+
+  # The value to use with method_options_key when distributing via iTunes Connect.
+  distribute_itc = 'app-store'
+
+  # The location where derived data should be placed.
+  derived_data_folder = File.join('fastlane', 'derived_data')
+
+  #########################
+  # Per-Project Variables #
+  #########################
+
+  # The name of the main scheme for building and testing the app. Must be a shared scheme!
+  main_scheme = 'SpotHero_StagingServer_Debug'
+
+  # The build scheme to use when building for ad-hoc distribution, pointed at production.
+  # Must be a shared scheme!
+  ad_hoc_prod_scheme = 'SpotHero_ProdServer_AdHoc'
+
+  # The build scheme to use when building for iTunes Connect distribution, pointed at production.
+  # Must be a shared scheme!
+  app_store_prod_scheme = 'SpotHero_ProdServer_AppStore'
+
+  # The path to the .xcworkspace file
+  workspace_file = 'SpotHero.xcworkspace'
+
+  # The path to the .xcodeproj for the framework (for getting coverage info)
+  project_file = 'SpotHero/SpotHero.xcodeproj'
+
+  # The identifier of the team to use when retrieving provisioning profiles
+  team_identifier = 'ZW7QWR628D'
+
+  # The numeric ID of the team to use when talking to App Store Connect
+  appstore_connect_team_identifier = '942493'
+
+  ###########
+  ## SETUP ##
+  ###########
+
+  before_all do
+    load_local_dotenv unless is_ci
+    use_xcode_10
+  end
+
+  def output_directory
+    if bitrise?
+      ENV['BITRISE_DEPLOY_DIR']
+    else
+      './fastlane/output'
+    end
+  end
+
+  def use_xcode_10
+    # Select the new hotness version of Xcode.
+    xcversion(version: '~>10')
+  end
+
+  def bitrise?
+    ENV.key?('BITRISE_IO')
+  end
+
+  def build_host
+    if bitrise?
+      'Bitrise'
+    elsif is_ci
+      'CI'
+    else
+      'Local'
+    end
+  end
+
+  # The prefix prepended to the build tag on version bump
+  def build_tag_prefix
+    'builds/b'
+  end
+
+  def should_upload
+    branch = git_branch
+
+    if is_ci
+      branch == 'origin/develop' || !!(branch =~ %r{origin\/releases\/.*})
+    else
+      branch == 'develop' || !!(branch =~ %r{releases\/.*})
+    end
+  end
+
+  # The default payload for every Slack message
+  def default_payload
+    payload = {
+      'Build Date' => Time.new.to_s,
+      'Build Host' => build_host
+    }
+
+    payload['Build Number'] = !ENV['BITRISE_BUILD_NUMBER'].nil? ? ENV['BITRISE_BUILD_NUMBER'] : 1
+    payload['Version'] = lane_context[SharedValues::VERSION_NUMBER] unless lane_context[SharedValues::VERSION_NUMBER].nil?
+    payload['HockeyApp URL'] = lane_context[SharedValues::HOCKEY_DOWNLOAD_LINK] unless lane_context[SharedValues::HOCKEY_DOWNLOAD_LINK].nil?
+    payload['Bitrise URL'] = ENV['BITRISE_BUILD_URL'] unless ENV['BITRISE_BUILD_URL'].nil?
+
+    payload
+  end
+
+  # The app identifier (com.x.y) of the application
+  def app_identifier
+    'com.spothero.spothero'
+  end
+
+  def app_identifier_imessage
+    "#{app_identifier}.SpotHeroiMessage"
+  end
+
+  def app_identifier_todayextension
+    "#{app_identifier}.todayextensionwidget"
+  end
+
+  def app_identifier_watchkitapp
+    "#{app_identifier}.watchkitapp"
+  end
+
+  def app_identifier_watchkitappextension
+    "#{app_identifier}.watchkitapp.watchkitextension"
+  end
+
+  #############################
+  ## TESTING & CODE COVERAGE ##
+  #############################
+
+  desc 'Runs all the tests for the app and runs Danger if on CI.'
+  lane :test do |options|
+    # passing in UI_TEST_SCREENSHOT_DIR to xcodebuild will make KIF take a screenshot on each test failure and put them here
+    # this is set up so that those screenshots are visible on Bitrise in the "Apps & Artifacts" tab
+
+    # Run tests for the main scheme in the workspace
+    scan(
+      workspace: workspace_file,
+      scheme: main_scheme,
+      skip_slack: !is_ci, # only let us know if we're on CI
+      output_directory: output_directory,
+      derived_data_path: derived_data_folder,
+      xcargs: "UI_TEST_SCREENSHOT_DIR='#{output_directory}'",
+      clean: true,
+      devices: ['iPhone 8'],
+      skip_build: true, # the test action will already kick off a build, don't build twice
+      result_bundle: true,
+      output_types: '', # guarantees only xcode plist files are generated
+      code_coverage: true,
+      fail_build: false, # danger will handle it
+    )
+
+    # Converts the xcode plist files into junit results
+    # Instead of the default fail_build: true, analyze test_reports to check for failures
+    test_reports = trainer(
+      extension: '.junit',
+      fail_build: false, # danger will handle it
+      output_directory: output_directory,
+      path: "#{output_directory}/#{main_scheme}.test_result",
+    )
+
+    # Get the first key/value pair out of the test_reports dictionary
+    # key = junit report path
+    # value = whether the specific report for that key passed
+    junit_path, did_pass = test_reports.first
+
+    # Set Danger's junit path to the output from trainer
+    options[:junit_path] = junit_path
+
+    # If tests failed, xchtmlreport will generate a human-readable HTML test report
+    unless did_pass
+      # Installs xchtmlreport only if it's not already installed
+      # Bitrise should handle this for is in using "deps" for the step (see bitrise.yml)
+      sh 'cd .. && scripts/install_xchtmlreport.sh'
+
+      # Run xchtmlreport and tell it where to output the report
+      sh "cd .. && xchtmlreport -r #{output_directory}"
+    end
+
+    # Whether the above passes or fails, we want to run danger
+    run_danger(options) if is_ci
+
+    # Only check for failures if they've been set by Danger
+    next unless ENV.key?('DANGER_JUNIT_FAILURES_COUNT')
+
+    # Convert the count of test failures to an integer
+    test_failures = ENV['DANGER_JUNIT_FAILURES_COUNT'].to_i
+
+    # If there were any test_failures, this guarantees the CI build will fail as well
+    UI.crash!("#{test_failures} tests failed!") unless test_failures.zero?
+  end
+
+  ########################
+  ## BUILDING & SIGNING ##
+  ########################
+
+  desc 'Registers devices on the Apple Developer Portal.'
+  lane :register do |_options|
+    register_devices(
+      devices_file: './registered_devices.txt',
+      team_id: team_identifier,
+      username: ci_username,
+    )
+  end
+
+  desc 'Syncs codesigning certificates and provisioning profiles via Fastlane Match.'
+  lane :certify do |options|
+    # no matter what we do with signing below, it's always good to update Apple Member Center devices
+    register
+
+    raise 'Not all required options for this lane are present!' unless options.key?(:method_options_key)
+
+    force = !options[:force].nil? ? options[:force] : false
+    readonly = !options[:readonly].nil? ? options[:readonly] : false
+
+    case options[:method_options_key]
+    when distribute_development
+      type = 'development'
+    when distribute_ad_hoc
+      type = 'adhoc'
+    when distribute_itc
+      type = 'appstore'
+    else
+      raise 'Invalid method_options_key!'
+    end
+
+    if is_ci
+      ENV['MATCH_GIT_FULL_NAME'] = 'iOS CI Bot'
+      ENV['MATCH_GIT_USER_EMAIL'] = 'ci-ios@spothero.com'
+    end
+
+    match(
+      app_identifier: [
+        app_identifier,
+        app_identifier_imessage,
+        app_identifier_todayextension,
+        app_identifier_watchkitapp,
+        app_identifier_watchkitappextension
+      ],
+      force: force,
+      force_for_new_devices: true,
+      readonly: readonly,
+      team_id: team_identifier,
+      type: type,
+    )
+  end
+
+  desc 'Uses gym to output a build with the specified options.'
+  desc 'Expects values for the following keys:'
+  desc 'method_options_key: Specify the distribution method'
+  desc 'scheme_options_key: The scheme to use for building'
+  private_lane :archive_build do |options|
+    raise 'Not all required options for this lane are present!' if !options.key?(:method_options_key) || !options.key?(:scheme_options_key)
+
+    method = options[:method_options_key]
+    scheme = options[:scheme_options_key]
+
+    output_name = get_output_name(xcodeproj: project_file)
+
+    # If BITRISE_BUILD_NUMBER is exported (meaning we're running on Bitrise CI),
+    # set all project targets to the BITRISE_BUILD_NUMBER
+    build_number = ENV['BITRISE_BUILD_NUMBER']
+
+    unless build_number.nil?
+      increment_build_number(
+        build_number: build_number,
+        xcodeproj: project_file,
+      )
+    end
+
+    # Archive away!
+    gym(
+      workspace: workspace_file,
+      scheme: scheme,
+      export_method: method,
+      output_directory: output_directory,
+      output_name: output_name,
+      derived_data_path: derived_data_folder,
+      include_symbols: true,
+      clean: true,
+    )
+
+    # Get version number from the newly generated IPA
+    version = version_from_ipa(ipa: "#{output_directory}/#{output_name}.ipa")
+
+    # Store this in the lane context
+    lane_context[SharedValues::VERSION_NUMBER] = version
+
+    # Create a new Sentry release for this version
+    create_new_sentry_release(version: version)
+
+    # gym sets DSYM_OUTPUT_PATH once symbols are generated
+    # we'll add it to an array and set DSYM_PATHS to make it work with the upload_dsyms step
+    dsym_path = lane_context[SharedValues::DSYM_OUTPUT_PATH]
+    lane_context[SharedValues::DSYM_PATHS] = [dsym_path]
+
+    # Upload dSYMs to services that need them
+    upload_dsyms
+
+    # Associate commits with the new Sentry release version
+    associate_sentry_commits(version: version)
+  end
+
+  desc 'Responsible for building and signing the app for ad-hoc distribution'
+  private_lane :build_ad_hoc do
+    certify(
+      method_options_key: distribute_ad_hoc,
+    )
+
+    # Build app for ad-hoc release
+    archive_build(
+      method_options_key: distribute_ad_hoc,
+      scheme_options_key: ad_hoc_prod_scheme,
+    )
+  end
+
+  desc 'Responsible for building and signing the app for App Store or Test Flight distribution'
+  desc 'Note: This will always create a build pointed at Production.'
+  private_lane :build_itc do
+    certify(
+      method_options_key: distribute_itc,
+    )
+
+    # Build Production-pointed app for App Store / Test Flight
+    archive_build(
+      method_options_key: distribute_itc,
+      scheme_options_key: app_store_prod_scheme,
+    )
+  end
+
+  ###############
+  # CONVENIENCE #
+  ###############
+
+  def version_from_ipa(options = {})
+    ipa_path = options[:ipa]
+
+    UI.user_error!('ipa is required! (version_from_ipa)') if ipa_path.nil?
+
+    get_ipa_info_plist_value(
+      ipa: ipa_path,
+      key: 'CFBundleShortVersionString',
+    )
+  end
+
+  ###################
+  # GIT CONVENIENCE #
+  ###################
+
+  # TODO: This isn't returning a version, it's returning a build number. We should update it as such.
+  desc 'Calculates what the current version is from tags across multiple different branches.'
+  desc 'Returns what the version should be, as an integer.'
+  def calculate_current_version
+    # Ensure we've fetch the latest tags before calling "git describe --tags"
+    sh('git fetch --tags')
+
+    version = sh("git describe --tags $(git rev-list --tags='#{build_tag_prefix}[0-9]*' --max-count=1) --abbrev=0")
+
+    # slice off the build tag prefix from the version
+    version.slice!(build_tag_prefix)
+
+    # trim off the b
+    trimmed_version = version
+
+    # make it an integer
+    integer_version = trimmed_version.to_i
+    current_version = integer_version + 1
+    current_version
+  end
+
+  desc 'Grabs the current branch from whatever relevant items we can find.'
+  desc 'Returns the name of the current branch.'
+  def current_branch
+    # For some reason, Jenkins is checking out a detached HEAD instead of the appropriate branch.
+    current_branch = ENV['GIT_BRANCH']
+    if current_branch
+      # Split on the first slash to trim the remote name off the branch name
+      split_on_first_slash = current_branch.split('/', 2)
+      current_branch = split_on_first_slash[1]
+    else
+      # We're not getting it from the environment - grab it from git by finding the starred branch.
+      current_branch = sh('git branch | grep \\*')
+
+      # Trim off the "* " bit (2 characters)
+      current_branch = current_branch[2..current_branch.length]
+    end
+
+    # make sure to kill any trailing newline
+    current_branch.chomp
+  end
+
+  desc 'Checks out the current branch at the command line'
+  def checkout_current_branch
+    # Check out the appropriate branch
+    sh 'git checkout ' + current_branch
+  end
+
+  desc 'Creates a changelog from the various changes on a given merge, or the current '
+  desc 'commit if not a merge commit.'
+  desc 'Returns the log as a string.'
+  def create_changelog
+    format = '- %h: %s (%an)'
+    branch_name = current_branch
+    checkout_current_branch
+    show = sh('git show --oneline --pretty="%p"')
+    lines = show.split("\n", 2)
+    possible_merge = lines[0]
+    commits = possible_merge.split(' ')
+
+    # default to only showing one commit if it's not a merge.
+    limit = '--max-count=1'
+    if commits.count == 2
+      # This is a merge commit, show all the commits between w/o merges
+      from = commits[0]
+      to = commits[1]
+      limit = "#{from}...#{to}"
+    end
+
+    log = sh("git log #{branch_name} --pretty=\"#{format}\" --no-merges #{limit}")
+    log
+  end
+
+  def get_build_setting(options = {})
+    if options[:xcodeproj].nil?
+      UI.error 'xcodeproj parameter must be provided'
+      return nil
+    end
+
+    if options[:setting].nil?
+      UI.error 'setting parameter must be provided'
+      return nil
+    end
+
+    fastlane_require 'xcodeproj'
+
+    project = Xcodeproj::Project.open("../#{options[:xcodeproj]}")
+
+    config = if options[:configuration].nil?
+               project.build_configurations.first
+             else
+               project.build_configurations.select { |t| t.name == options[:configuration] }.first
+             end
+
+    setting = config.build_settings[options[:setting]]
+
+    setting
+  end
+
+  def get_output_name(options = {})
+    if options[:xcodeproj].nil?
+      UI.error 'xcodeproj parameter must be provided'
+      return nil
+    end
+
+    build_number = get_build_number(xcodeproj: options[:xcodeproj])
+
+    # TODO: This isn't being set properly, resulting in files like 'SpotHero--1234.ipa'
+    bundle_version = get_build_setting(
+      xcodeproj: options[:xcodeproj],
+      setting: 'COMMON_APP_VERSION',
+    )
+
+    "SpotHero-#{bundle_version}-#{build_number}"
+  end
+
+  ##################
+  ## DISTRIBUTION ##
+  ##################
+
+  desc 'Builds and uploads to HockeyApp'
+  desc 'prod_options_key: True to make the build point at production. False to make the build point at staging.'
+  desc 'changelog_options_key: The changelog for this build'
+  private_lane :hockey_build_and_upload do
+    changelog = create_changelog
+    environment = 'PRODUCTION'
+
+    build_ad_hoc
+
+    unless should_upload
+      UI.message "We're in the #{git_branch} branch, not in develop or releases/* branch, so don't upload to HockeyApp!"
+      alert(
+        message: "#{environment} build successful! (Testing only, not uploaded to HockeyApp.)",
+        success: true,
+      )
+      next
+    end
+
+    release_notes = "This #{environment} build was automatically uploaded by Fastlane (#{build_host}).\n\n#{changelog}"
+
+    # Upload to HockeyApp and notify testers
+    hockey(
+      notes: release_notes,
+      bypass_cdn: true, # Bypasses cloudfront, which sometimes throws errors even when uploads succeed.
+      notify: '1', # Means yes, notify
+      status: '2', # Means users can download
+    )
+
+    alert(
+      message: "#{environment} build uploaded to HockeyApp!",
+      success: true,
+    )
+  end
+
+  desc 'Uploads a build pointed at Production to iTunes Connect'
+  desc 'Note: This build can be used for either Test Flight or App Store submission.'
+  lane :itc do
+    # Create an iTunes Connect build
+    build_itc
+
+    unless should_upload
+      UI.message "We're in the #{git_branch} branch, not in develop or releases/* branch, so don't upload to App Store Connect!"
+      alert(message: 'App Store Connect build successful! (Testing only, not uploaded App Store Connect.)', success: true)
+      next
+    end
+
+    # Upload build to TestFlight
+    pilot(
+      username: ci_username,
+      team_id: appstore_connect_team_identifier,
+      changelog: "This PRODUCTION build was automatically uploaded by Fastlane (#{build_host})" \
+      ' - DO NOT SUBMIT FOR TEST FLIGHT OR THE APP STORE UNTIL RELEASE NOTES ARE UPDATED!!!!',
+      distribute_external: false,
+      skip_submission: true,
+      app_identifier: app_identifier,
+      skip_waiting_for_build_processing: true,
+    )
+
+    alert(message: 'PRODUCTION build uploaded to App Store Connect!', success: true)
+  end
+
+  desc 'Uploads beta builds to HockeyApp.'
+  lane :upload_beta_build do
+    hockey_build_and_upload
+  end
+
+  desc 'Uploads release candidate builds to HockeyApp and App Store Connect'
+  lane :upload_release_candidate_builds do
+    hockey_build_and_upload
+    itc
+  end
+
+  desc 'Uploads dSYMs to services that need them. (Crashlytics, Sentry, etc.)'
+  lane :upload_dsyms do |options|
+    # whether or not the upload is for bitcode symbols or not
+    includes_bitcode = options[:bitcode] || false
+
+    if includes_bitcode
+      # if we're including bitcode, we can specify more about what bitcode dSYMs we want
+
+      # The app build_number for dSYMs you wish to download
+      build_number = options[:build_number]
+
+      # The minimum app version for dSYMs you wish to download
+      min_version = options[:min_version]
+
+      # The app version for dSYMs you wish to download, pass in 'latest' to download only the latest build's dSYMs
+      version = options[:version]
+
+      # downloads dSYMs from App Store Connect and sets the output path in ENV['DSYM_PATHS'] automatically
+      download_dsyms(
+        build_number: build_number,
+        min_version: min_version,
+        output_directory: output_directory,
+        version: version,
+      )
+    end
+
+    # get dsym_paths from options or lane context, create empty array if it doesn't exist
+    dsym_paths = options[:dsym_paths] || lane_context[SharedValues::DSYM_PATHS] || []
+
+    # warn the user if they are using both dsym_path and dsym_paths
+    UI.important 'dsym_path and dsym_paths should not both be specified.' if options[:dsym_path] && !dsym_paths.empty?
+
+    # add dsym_path to the array if it exists
+    dsym_paths << options[:dsym_path] if options[:dsym_path]
+
+    # if there are no dsym_paths, throw an error
+    UI.user_error!('Unable to upload symbols to Crashlytics. dsym_paths not found.') if dsym_paths.empty?
+
+    # alert the user which paths are being uploaded
+    UI.message 'Uploading the following symbols:'
+
+    # make a pseudo bulleted list for easy reading
+    dsym_paths.each do |path|
+      UI.message "  - #{path}"
+    end
+
+    # set dsym_paths into options to pass along
+    options[:dsym_paths] = dsym_paths
+
+    # Uploads symbols to Crashlytics
+    upload_dsyms_to_crashlytics(options)
+
+    # Uploads symbols to Sentry
+    upload_dsyms_to_sentry(options)
+  end
+
+  private_lane :upload_dsyms_to_crashlytics do |options|
+    # get dsym_paths out of options dictionary
+    dsym_paths = options[:dsym_paths]
+
+    # if there are no dsym_paths, throw an error
+    UI.user_error!('Unable to upload symbols to Crashlytics. dsym_paths not found.') if dsym_paths.empty?
+
+    upload_symbols_to_crashlytics(
+      dsym_paths: dsym_paths,
+    )
+  end
+
+  private_lane :upload_dsyms_to_sentry do |options|
+    # get dsym_paths out of options dictionary
+    dsym_paths = options[:dsym_paths]
+
+    # if there are no dsym_paths, throw an error
+    UI.user_error!('Unable to upload symbols to Crashlytics. dsym_paths not found.') if dsym_paths.empty?
+
+    ensure_sentry_cli_installed
+
+    # sentry_upload_dsym can't take an array of paths, so we upload one-by-one
+    dsym_paths.each do |dsym_path|
+      sentry_upload_dsym(
+        dsym_path: dsym_path,
+        info_plist: './SpotHero/SpotHero/Config/Info.plist',
+      )
+    end
+  end
+
+  ############
+  ## Sentry ##
+  ############
+
+  desc 'Creates a new release in sentry. Does not fire an error on duplicates.'
+  lane :create_new_sentry_release do |options|
+    version = options[:version]
+
+    # We can't get the version automatically because it's set in the xcconfig, so throw an error if it's not supplied
+    UI.user_error!('Version is must be manually passed into create_new_sentry_release.') if version.nil?
+
+    ensure_sentry_cli_installed
+
+    sentry_create_release(
+      version: version,
+      # app_identifier: ENV['SH_APP_IDENTIFIER'],
+    )
+  end
+
+  desc 'Associated sentry commits to a specific release version.'
+  lane :associate_sentry_commits do |options|
+    version = options[:version]
+
+    # We can't get the version automatically because it's set in the xcconfig, so throw an error if it's not supplied
+    UI.user_error!('Version is must be manually passed into associate_sentry_commits.') if version.nil?
+
+    ensure_sentry_cli_installed
+
+    previous_commit = options[:previous_commit] # optional
+
+    # If latest_commit isn't passed in, we get the latest git commit hash on the current branch
+    latest_commit = options[:latest_commit] || last_git_commit[:commit_hash]
+
+    # Sentry org and project slugs
+    auth_token = ENV['SENTRY_AUTH_TOKEN']
+    org_slug = ENV['SENTRY_ORG_SLUG']
+
+    # GitHub Repository slug, case sensitive and in owner/repo format
+    repo_slug = ENV['SH_REPO']
+
+    # If a previous commit was passed in, the format is 'previous..latest', otherwise just use the latest commit hash
+    commit_range = previous_commit.nil? ? latest_commit : "#{previous_commit}..#{latest_commit}"
+
+    # TODO: We need to monitor the command below to verify that hotfix versions and new CI builds will set commits appropriately.
+    #       If we ever want to send the previous, this will likely need to be a manual call. Would be in format 'repo@from..to'.
+
+    # Associates commits with the release, automatically uses the last release's latest commit so we only need to pass in the current commit
+    sh "cd .. && SENTRY_ORG=#{org_slug} SENTRY_AUTH_TOKEN=#{auth_token}"\
+      ' sentry-cli releases set-commits'\
+      " --commit \"#{repo_slug}@#{commit_range}\" #{version}"
+  end
+
+  # TODO: Add version check for sentry-cli if we ever notice inconsistent results
+  desc "Checks if sentri-cli is installed. If it isn't, this command will install it"
+  private_lane :ensure_sentry_cli_installed do
+    # installs the sentry-cli command ONLY if it does not exist
+    # to update, you must must run `sentry-cli update` manually
+    sh 'cd .. && scripts/install_sentry_cli.sh'
+  end
+
+  ############
+  ## DOTENV ##
+  ############
+
+  desc 'Loads the .env.local file.'
+  private_lane :load_local_dotenv do
+    # validate that the .env.local file exists
+    validate_local_dotenv
+
+    # overload the .env.local env vars
+    Dotenv.overload '.env.local'
+  end
+
+  desc 'Validates that the user has a .env.local in their fastlane folder.'
+  private_lane :validate_local_dotenv do
+    unless File.exist?('.env.local')
+      UI.user_error!('.env.local could not be found. See the README section "Running Fastlane Locally" for more details.')
+    end
+  end
+
+  ####################
+  ## SCRIPT HELPERS ##
+  ####################
+
+  desc 'Sorts the Xcode project file and commits the changes.'
+  desc 'Will only run if the current git status is clean.'
+  lane :sort_project do
+    ## Check if there are unstaged files
+    repo_status = sh 'git status --porcelain'
+
+    should_auto_commit = repo_status.empty?
+
+    ## Run the sort script
+    sh 'cd .. && perl Scripts/sort-xcode-project-file.pl SpotHero.xcodeproj'
+
+    ## Check if project file was actually sorted
+    changed_file_name = sh 'git diff --name-only ../SpotHero.xcodeproj/project.pbxproj'
+
+    if changed_file_name.strip != 'SpotHero.xcodeproj/project.pbxproj'
+      UI.message 'Project file was already sorted.'
+      next
+    end
+
+    UI.message 'Sorted project file!'
+
+    if should_auto_commit
+      UI.message 'Commiting changes...'
+      git_commit(path: 'SpotHero.xcodeproj/project.pbxproj', message: '[fastlane] ran sort script')
+    end
+  end
+
+  ######################
+  ## FAILURE HANDLING ##
+  ######################
+
+  # This gets called if anything failed along the way
+  error do |_lane, exception|
+    alert(message: exception.message, success: false)
+  end
+
+  ####################
+  ## Imported Lanes ##
+  ####################
+
+  # These lanes are mostly copied from MasterFastfile and can be deleted once that is imported
+
+  lane :run_danger do |options|
+    next if options[:skip_danger]
+
+    IS_LOCAL = !is_ci
+
+    # we do this due to a Bitrise bug, which is being addressed by their team
+    if !IS_LOCAL && ENV.key?('GIT_REPOSITORY_URL')
+      git_repository_url = ENV['GIT_REPOSITORY_URL']
+      ENV['GIT_REPOSITORY_URL'] = git_repository_url.sub('https://', '')
+    end
+
+    # we can only run danger locally if we pass in a pull request ID
+    if IS_LOCAL && options[:pr]
+      pull_request = "https://github.com/spothero/SpotHero-iOS/pull/#{options[:pr]}"
+    elsif IS_LOCAL && options[:pr].nil?
+      UI.user_error!('Unable run danger locally without specifying a pull request ID! Use the pr: lane parameter to do so.')
+      next
+    elsif !IS_LOCAL && options[:pr]
+      UI.user_error!('Pull request ID can only be specified when running danger locally.')
+    end
+
+    # Our Dangerfile uses this value to find the junit report generated by scan
+    ENV['DANGER_JUNIT_PATH'] = options[:junit_path]
+
+    danger(
+      github_api_token: ENV['GITHUB_ACCESS_TOKEN'],
+      new_comment: true,
+      pr: pull_request,
+      verbose: true,
+    )
+  end
+
+  desc 'Displays a notification if local, sends a message to slack if remote.'
+  private_lane :alert do |options|
+    message = options[:message]
+
+    # If there is no message, don't alert
+    next unless message
+
+    payload = options[:payload].nil? ? default_payload : options[:payload]
+    success = options[:success].nil? ? false : options[:success]
+    force_slack = options[:force_slack].nil? ? false : options[:force_slack]
+
+    # If local, send local notification, otherwise send a slack message (unless force_slack = true)
+    if !is_ci && !force_slack
+      notification(subtitle: 'Error', message: message)
+
+      say message if options[:say]
+    else
+      slack(
+        # default_payloads: [:git_author, :git_branch, :git_commit, :git_commit_hash],
+        message: message,
+        payload: payload,
+        success: success,
+      )
+    end
+  end
+end
